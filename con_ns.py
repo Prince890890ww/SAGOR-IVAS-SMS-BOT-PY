@@ -3,7 +3,7 @@ import requests
 import time
 
 # --- কনফিগারেশন ---
-BOT_TOKEN = ""
+BOT_TOKEN = "8742533897:AAFzNjPl0x-PQf9eZ7QUeOWoo0AUa-BpZPI"
 CHAT_ID = -1003007557624          # আপনার গ্রুপের চ্যাট আইডি
 ADMIN_ID = 7095358778              # আপনার টেলিগ্রাম আইডি
 
