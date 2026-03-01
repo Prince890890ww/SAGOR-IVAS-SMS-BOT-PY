@@ -9,6 +9,7 @@ from datetime import datetime
 import os
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import concurrent.futures
+from collections import defaultdict
 from con_ns import (
     BOT_TOKEN,
     CHAT_ID,
@@ -21,36 +22,39 @@ from con_ns import (
     START_DATE,
     country_codes
 )
-# ================= CONFIG ================
 
-# ⚡ দ্রুত পোলিং এর জন্য ৩ সেকেন্ড
-POLL_INTERVAL_SECONDS = 3
-MAX_WORKERS = 10  # একসাথে বেশি নাম্বার চেক করবে
+# ================= আলট্রা-ফাস্ট কনফিগার ================
+
+# ⚡⚡⚡ ফাস্টেস্ট সেটিংস ⚡⚡⚡
+POLL_INTERVAL_SECONDS = 1  # ১ সেকেন্ড পরপর চেক (সবচেয়ে দ্রুত)
+MAX_WORKERS = 50  # ৫০টি নাম্বার একসাথে চেক করবে
+CONNECTION_POOL_SIZE = 100  # ১০০টি কানেকশন পুল
 
 RANGES_DIR = "ranges"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# 🔧 সেশন কনফিগারেশন
+# ================= আলট্রা-ফাস্ট সেশন সেটআপ =================
+
 session = requests.Session()
 
-# কানেকশন পুল বাড়ানো
+# বিশাল কানেকশন পুল
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=20,
-    pool_maxsize=20,
+    pool_connections=CONNECTION_POOL_SIZE,
+    pool_maxsize=CONNECTION_POOL_SIZE,
     max_retries=3,
     pool_block=False
 )
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
-# Retry setup with connection errors
+# দ্রুত রিট্রাই স্ট্রাটেজি
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 retry_strategy = Retry(
-    total=5,  # বেশি রিট্রাই
-    backoff_factor=0.5,  # কম সময়ে রিট্রাই
+    total=3,
+    backoff_factor=0.1,  # ০.১ সেকেন্ড পরপর রিট্রাই (সবচেয়ে দ্রুত)
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
 )
@@ -62,23 +66,51 @@ csrf_token = None
 seen_otps = {}
 user_states = {}
 last_reset_time = time.time()
+failed_attempts = defaultdict(int)  # fail ট্র্যাকিং
+range_cache = []  # ক্যাশ
+last_cache_update = 0
 
 if not os.path.exists(RANGES_DIR):
     os.makedirs(RANGES_DIR)
 
-# দেশের কোড + নাম + ফ্ল্যাগ
+# ================= ক্যাশ ফাংশন =================
+
+def get_all_numbers_cached():
+    """নাম্বার ক্যাশ করে (প্রতি ১০ সেকেন্ড পর আপডেট)"""
+    global range_cache, last_cache_update
+    now = time.time()
+    if now - last_cache_update > 10 or not range_cache:
+        range_cache = load_all_numbers()
+        last_cache_update = now
+    return range_cache
+
+def load_all_numbers():
+    all_items = []
+    try:
+        for fn in os.listdir(RANGES_DIR):
+            if fn.endswith(".txt"):
+                range_name = fn[:-4].replace("_", " ")
+                path = os.path.join(RANGES_DIR, fn)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        nums = [line.strip() for line in f if line.strip()]
+                    for n in nums:
+                        all_items.append({"number": n, "range": range_name})
+                except Exception as e:
+                    print(f"File read error {fn}: {e}")
+    except Exception as e:
+        print(f"Error loading numbers: {e}")
+    return all_items
 
 def reset_session_if_needed():
-    """প্রতি ১০ মিনিট পর সেশন রিসেট করে (স্টল প্রতিরোধ)"""
     global session, last_reset_time
     now = time.time()
-    if now - last_reset_time > 600:  # ১০ মিনিট
+    if now - last_reset_time > 120:  # ২ মিনিট পর রিসেট
         print("[SESSION] রিসেট করা হচ্ছে...")
         session = requests.Session()
-        # কানেকশন পুল আবার সেট
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=20,
-            pool_maxsize=20,
+            pool_connections=CONNECTION_POOL_SIZE,
+            pool_maxsize=CONNECTION_POOL_SIZE,
             max_retries=3
         )
         session.mount('http://', adapter)
@@ -91,7 +123,7 @@ def login_and_get_csrf():
     global csrf_token
     try:
         reset_session_if_needed()
-        r = session.get(LOGIN_URL, timeout=30)
+        r = session.get(LOGIN_URL, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
         token_tag = soup.find("input", {"name": "_token"})
         if not token_tag or "value" not in token_tag.attrs:
@@ -99,12 +131,12 @@ def login_and_get_csrf():
         initial_token = token_tag["value"]
 
         payload = {"_token": initial_token, "email": EMAIL, "password": PASSWORD}
-        r_post = session.post(LOGIN_URL, data=payload, timeout=30)
+        r_post = session.post(LOGIN_URL, data=payload, timeout=10)
 
         if r_post.status_code != 200 or "login" in r_post.url.lower():
             return False
 
-        r_portal = session.get(PORTAL_URL, timeout=30)
+        r_portal = session.get(PORTAL_URL, timeout=10)
         soup_portal = BeautifulSoup(r_portal.text, "html.parser")
 
         meta = soup_portal.find("meta", {"name": "csrf-token"})
@@ -123,7 +155,15 @@ def login_and_get_csrf():
         return False
 
 def fetch_otps(number, range_name):
-    global csrf_token
+    global csrf_token, failed_attempts
+    
+    # যদি এই নাম্বার ২ বার fail করে, তাহলে কিছুক্ষণ স্কিপ
+    if failed_attempts[number] > 2:
+        if time.time() - failed_attempts[f"{number}_time"] < 30:
+            return None, "Skipping temporarily"
+        else:
+            failed_attempts[number] = 0
+
     if not csrf_token and not login_and_get_csrf():
         return None, "লগইন/CSRF সমস্যা"
 
@@ -140,21 +180,23 @@ def fetch_otps(number, range_name):
         "Referer": PORTAL_URL,
         "Accept": "*/*",
         "Content-Type": "application/x-www-form-urlencoded",
-        "Connection": "keep-alive"
+        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip, deflate"
     }
 
     try:
-        # টাইমআউট বাড়ানো
-        r = session.post(SMS_URL, data=payload, headers=headers, timeout=45)
+        r = session.post(SMS_URL, data=payload, headers=headers, timeout=10)
 
         if r.status_code == 419:
             if login_and_get_csrf():
                 headers["X-CSRF-TOKEN"] = csrf_token
-                r = session.post(SMS_URL, data=payload, headers=headers, timeout=45)
+                r = session.post(SMS_URL, data=payload, headers=headers, timeout=10)
             else:
                 return None, "419 - CSRF fail"
 
         if r.status_code != 200:
+            failed_attempts[number] += 1
+            failed_attempts[f"{number}_time"] = time.time()
             return None, f"HTTP {r.status_code}"
 
         soup = BeautifulSoup(r.text, "html.parser")
@@ -186,23 +228,53 @@ def fetch_otps(number, range_name):
             else:
                 messages.append({"otp": None, "full_body": full_text})
 
+        # সফল হলে fail count রিসেট
+        if number in failed_attempts:
+            del failed_attempts[number]
+
         return messages, None
 
-    except requests.exceptions.ConnectionError as e:
-        print(f"[CONNECTION ERROR] {number}: {e}")
-        # কানেকশন error হলে সেশন রিসেট
-        reset_session_if_needed()
-        return None, "Connection error"
-    except requests.exceptions.Timeout as e:
-        print(f"[TIMEOUT ERROR] {number}: {e}")
-        return None, "Timeout"
     except Exception as e:
-        print(f"[FETCH ERR] {number}: {e}")
-        return None, "এরর"
+        failed_attempts[number] += 1
+        failed_attempts[f"{number}_time"] = time.time()
+        return None, str(e)
+
+def detect_service(text):
+    """দ্রুত সার্ভিস ডিটেকশন"""
+    lower = text.lower()
+    
+    services = {
+        "whatsapp": ["whatsapp", "wa"],
+        "telegram": ["telegram", "tg"],
+        "facebook": ["facebook", "fb"],
+        "instagram": ["instagram", "ig"],
+        "google": ["google", "gmail"],
+        "twitter": ["twitter", "x.com"],
+        "tiktok": ["tiktok"],
+        "snapchat": ["snapchat"],
+        "amazon": ["amazon"],
+        "netflix": ["netflix"],
+        "spotify": ["spotify"],
+        "discord": ["discord"],
+        "steam": ["steam"],
+        "binance": ["binance"],
+        "paypal": ["paypal"],
+        "uber": ["uber"],
+        "pathao": ["pathao"],
+        "foodpanda": ["foodpanda"],
+        "bkash": ["bkash"],
+        "nagad": ["nagad"]
+    }
+    
+    for service, keywords in services.items():
+        for kw in keywords:
+            if kw in lower:
+                return service.capitalize()
+    return "Other Service"
 
 def fetch_and_post_new_otps(number, range_name):
     msgs, err = fetch_otps(number, range_name)
-    if err:
+    if err or not msgs:
         return
 
     new_msgs = []
@@ -231,217 +303,10 @@ def fetch_and_post_new_otps(number, range_name):
         otp = msg['otp']
         otp_text = otp if otp else "❌ OTP NOT FOUND"
         full_body = msg['full_body']
+        client = detect_service(full_body)
 
-        # ক্লায়েন্ট ডিটেক্ট
-        lower = full_body.lower()
-        client = "Other Service"
-
-        # মেসেজিং অ্যাপস
-        if "whatsapp" in lower or "wa" in lower:
-            client = "WhatsApp"
-        elif "telegram" in lower or "tg" in lower:
-            client = "Telegram"
-        elif "signal" in lower:
-            client = "Signal"
-        elif "viber" in lower:
-            client = "Viber"
-        elif "line" in lower:
-            client = "Line"
-        elif "wechat" in lower or "微信" in lower:
-            client = "WeChat"
-        elif "imo" in lower:
-            client = "IMO"
-        elif "discord" in lower:
-            client = "Discord"
-        elif "skype" in lower:
-            client = "Skype"
-        elif "zoom" in lower:
-            client = "Zoom"
-        elif "messenger" in lower or "fb" in lower:
-            client = "Messenger"
-        
-        # সোশ্যাল মিডিয়া
-        elif "facebook" in lower or "fb" in lower:
-            client = "Facebook"
-        elif "instagram" in lower or "ig" in lower:
-            client = "Instagram"
-        elif "twitter" in lower or "x.com" in lower:
-            client = "Twitter/X"
-        elif "tiktok" in lower:
-            client = "TikTok"
-        elif "snapchat" in lower:
-            client = "Snapchat"
-        elif "linkedin" in lower:
-            client = "LinkedIn"
-        elif "pinterest" in lower:
-            client = "Pinterest"
-        elif "reddit" in lower:
-            client = "Reddit"
-        elif "threads" in lower:
-            client = "Threads"
-        
-        # গুগল সার্ভিস
-        elif "google" in lower or "gmail" in lower:
-            client = "Google"
-        elif "youtube" in lower:
-            client = "YouTube"
-        elif "drive" in lower or "google drive" in lower:
-            client = "Google Drive"
-        
-        # ই-কমার্স
-        elif "amazon" in lower:
-            client = "Amazon"
-        elif "ebay" in lower:
-            client = "eBay"
-        elif "aliexpress" in lower:
-            client = "AliExpress"
-        elif "alibaba" in lower:
-            client = "Alibaba"
-        elif "flipkart" in lower:
-            client = "Flipkart"
-        elif "shopify" in lower:
-            client = "Shopify"
-        elif "daraz" in lower:
-            client = "Daraz"
-        elif "walmart" in lower:
-            client = "Walmart"
-        
-        # পেমেন্ট/ফাইনান্স
-        elif "paypal" in lower:
-            client = "PayPal"
-        elif "paytm" in lower:
-            client = "Paytm"
-        elif "bkash" in lower:
-            client = "bKash"
-        elif "nagad" in lower:
-            client = "Nagad"
-        elif "rocket" in lower:
-            client = "Rocket"
-        elif "stripe" in lower:
-            client = "Stripe"
-        elif "venmo" in lower:
-            client = "Venmo"
-        elif "cash" in lower and "app" in lower:
-            client = "Cash App"
-        elif "wise" in lower or "transferwise" in lower:
-            client = "Wise"
-        
-        # ক্রিপ্টো
-        elif "binance" in lower:
-            client = "Binance"
-        elif "coinbase" in lower:
-            client = "Coinbase"
-        elif "kucoin" in lower:
-            client = "KuCoin"
-        elif "bybit" in lower:
-            client = "Bybit"
-        elif "okx" in lower:
-            client = "OKX"
-        elif "huobi" in lower:
-            client = "Huobi"
-        elif "kraken" in lower:
-            client = "Kraken"
-        elif "metamask" in lower:
-            client = "MetaMask"
-        
-        # গেমিং
-        elif "steam" in lower:
-            client = "Steam"
-        elif "epic" in lower and "games" in lower:
-            client = "Epic Games"
-        elif "playstation" in lower or "psn" in lower:
-            client = "PlayStation"
-        elif "xbox" in lower:
-            client = "Xbox"
-        elif "nintendo" in lower:
-            client = "Nintendo"
-        elif "roblox" in lower:
-            client = "Roblox"
-        elif "minecraft" in lower:
-            client = "Minecraft"
-        elif "riot" in lower or "lol" in lower or "valorant" in lower:
-            client = "Riot Games"
-        elif "blizzard" in lower or "warcraft" in lower:
-            client = "Blizzard"
-        elif "origin" in lower or "ea" in lower:
-            client = "EA"
-        
-        # স্ট্রিমিং
-        elif "netflix" in lower:
-            client = "Netflix"
-        elif "spotify" in lower:
-            client = "Spotify"
-        elif "twitch" in lower:
-            client = "Twitch"
-        elif "disney" in lower:
-            client = "Disney+"
-        elif "hulu" in lower:
-            client = "Hulu"
-        elif "prime" in lower or "amazon video" in lower:
-            client = "Amazon Prime"
-        elif "hotstar" in lower:
-            client = "Hotstar"
-        
-        # ডেলিভারি/রাইড শেয়ারিং
-        elif "uber" in lower:
-            client = "Uber"
-        elif "lyft" in lower:
-            client = "Lyft"
-        elif "pathao" in lower:
-            client = "Pathao"
-        elif "foodpanda" in lower:
-            client = "Foodpanda"
-        elif "swiggy" in lower:
-            client = "Swiggy"
-        elif "zomato" in lower:
-            client = "Zomato"
-        elif "bolt" in lower:
-            client = "Bolt"
-        elif "careem" in lower:
-            client = "Careem"
-        
-        # ব্যাংকিং
-        elif "bank" in lower:
-            client = "Bank"
-        elif "nrb" in lower:
-            client = "NRB Bank"
-        elif "dbbl" in lower or "dutch bangla" in lower:
-            client = "DBBL"
-        elif "sbl" in lower or "sonali bank" in lower:
-            client = "Sonali Bank"
-        elif "ibanking" in lower or "internet banking" in lower:
-            client = "Internet Banking"
-        
-        # অন্যান্য
-        elif "microsoft" in lower or "outlook" in lower or "live.com" in lower:
-            client = "Microsoft"
-        elif "apple" in lower or "icloud" in lower:
-            client = "Apple"
-        elif "yahoo" in lower:
-            client = "Yahoo"
-        elif "proton" in lower or "protonmail" in lower:
-            client = "Proton"
-        elif "zoho" in lower:
-            client = "Zoho"
-        elif "dropbox" in lower:
-            client = "Dropbox"
-        elif "airbnb" in lower:
-            client = "Airbnb"
-        elif "booking" in lower or "booking.com" in lower:
-            client = "Booking.com"
-        elif "canva" in lower:
-            client = "Canva"
-        elif "tinder" in lower:
-            client = "Tinder"
-        elif "bumble" in lower:
-            client = "Bumble"
-        elif "onlyfans" in lower:
-            client = "OnlyFans"
-
-        # full_body সেফ করা — HTML escape + # escape
         safe_body = html.escape(full_body).replace("#", "\\#").replace("<", "&lt;").replace(">", "&gt;")
 
-        # 📌 মেসেজ তৈরি - শেষ লাইনে "power by AH METHOD TEAM"
         message_text = f"""🔩🔩. <b>{flag} {client.upper()} 🅰🅷 🅼🅴🆃🅷🅾🅳 </b>.🔪🔪
 ﹐﹐﹐﹐﹐﹐﹐﹐﹐﹐﹐﹐﹐﹐
 <blockquote>{flag} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 » {country_name}
@@ -451,72 +316,58 @@ def fetch_and_post_new_otps(number, range_name):
 
 power by AH METHOD TEAM"""
 
-        # 📌 ৩টি বাটন তৈরি
         markup = InlineKeyboardMarkup()
         markup.row_width = 3
-        
-        # আপনার ইচ্ছামতো বাটনের নাম ও লিংক দিন
         button1 = InlineKeyboardButton("📢 NUMBER CHANNEL", url="https://t.me/blackotpnum")
         button2 = InlineKeyboardButton("💬 CHAT GROUP", url="https://t.me/EarningHub6112")
         button3 = InlineKeyboardButton("🤖 NUMBER BOT", url="https://t.me/ah_method_number_bot")
-        
         markup.add(button1, button2, button3)
 
         try:
             bot.send_message(CHAT_ID, message_text, reply_markup=markup)
-            print(f"[SENT] {client} OTP {otp} for {number} ({country_name}) with buttons")
+            print(f"[SENT] {client} OTP {otp} for {number}")
         except Exception as e:
-            print(f"[SEND ERR] {number} OTP {otp}: {e}")
-
-def load_all_numbers():
-    all_items = []
-    for fn in os.listdir(RANGES_DIR):
-        if fn.endswith(".txt"):
-            range_name = fn[:-4].replace("_", " ")
-            path = os.path.join(RANGES_DIR, fn)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    nums = [line.strip() for line in f if line.strip()]
-                for n in nums:
-                    all_items.append({"number": n, "range": range_name})
-            except Exception as e:
-                print(f"File read error {fn}: {e}")
-    return all_items
+            print(f"[SEND ERR] {number}: {e}")
 
 def polling_loop():
-    print(f"[POLLING] শুরু — প্রতি ~{POLL_INTERVAL_SECONDS} সেকেন্ডে (workers={MAX_WORKERS})")
+    print(f"[🚀] আলট্রা-ফাস্ট বট চালু হয়েছে!")
+    print(f"[⚡] পোলিং: প্রতি {POLL_INTERVAL_SECONDS} সেকেন্ড")
+    print(f"[🔥] ওয়ার্কার: {MAX_WORKERS}")
+    print(f"[💪] কানেকশন পুল: {CONNECTION_POOL_SIZE}")
+    
     consecutive_errors = 0
+    cycle_count = 0
+    
     while True:
         cycle_start = time.time()
+        cycle_count += 1
+        
         try:
-            items = load_all_numbers()
+            items = get_all_numbers_cached()
             count = len(items)
-            print(f"[POLL] {count} নম্বর চেক হচ্ছে...")
 
             if count > 0:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                     futures = [executor.submit(fetch_and_post_new_otps, item["number"], item["range"]) for item in items]
-                    concurrent.futures.wait(futures)
+                    concurrent.futures.wait(futures, timeout=5)
                 consecutive_errors = 0
-            else:
-                print(f"[POLL] কোনো নম্বর নেই")
 
             elapsed = time.time() - cycle_start
-            sleep_time = max(POLL_INTERVAL_SECONDS - elapsed, 1.0)
-            print(f"[POLL] সময় লাগেছে {elapsed:.2f}s → {sleep_time:.2f}s অপেক্ষা")
-            time.sleep(sleep_time)
+            sleep_time = max(POLL_INTERVAL_SECONDS - elapsed, 0.1)
+            
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
         except Exception as ex:
             consecutive_errors += 1
-            print(f"[POLL ERR] #{consecutive_errors}: {ex}")
+            print(f"[ERR] #{consecutive_errors}: {ex}")
             if consecutive_errors > 5:
-                print("[POLL] অনেক error, ৩০ সেকেন্ড বিরতি")
-                time.sleep(30)
+                time.sleep(10)
                 consecutive_errors = 0
             else:
-                time.sleep(10)
+                time.sleep(2)
 
-# --------------------- অ্যাডমিন প্যানেল ---------------------
+# ================= অ্যাডমিন প্যানেল =================
 
 def get_range_buttons():
     markup = InlineKeyboardMarkup(row_width=2)
@@ -541,9 +392,8 @@ def start(message):
     if message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "বট চালু আছে।")
         return
-
     markup = get_range_buttons()
-    bot.reply_to(message, "<b>অ্যাডমিন প্যানেল</b>\nরেঞ্জ সিলেক্ট করো বা নতুন অ্যাড করো:", reply_markup=markup)
+    bot.reply_to(message, "<b>⚡ আলট্রা-ফাস্ট অ্যাডমিন প্যানেল</b>\nরেঞ্জ সিলেক্ট করো:", reply_markup=markup)
 
 @bot.message_handler(commands=["delete"])
 def delete_cmd(message):
@@ -596,7 +446,7 @@ def callback_handler(call):
 
     elif call.data == "back_to_menu":
         bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              text="<b>অ্যাডমিন প্যানেল</b>", reply_markup=get_range_buttons())
+                              text="<b>⚡ আলট্রা-ফাস্ট অ্যাডমিন প্যানেল</b>", reply_markup=get_range_buttons())
 
 @bot.message_handler(func=lambda m: m.from_user.id in user_states and user_states[m.from_user.id].get("state") == "waiting_range_name")
 def handle_range_name(message):
@@ -670,12 +520,18 @@ if __name__ == "__main__":
 
     threading.Thread(target=polling_loop, daemon=True).start()
 
-    print("⚡ BOT STARTED → প্রতি ৩ সেকেন্ডে দ্রুত পোলিং চলছে")
-    print(f"📊 মোট নাম্বার: {len(load_all_numbers())}")
+    print("\n" + "="*50)
+    print("⚡⚡⚡ আলট্রা-ফাস্ট বট চালু ⚡⚡⚡")
+    print("="*50)
+    print(f"📊 পোলিং: প্রতি {POLL_INTERVAL_SECONDS} সেকেন্ড")
+    print(f"🚀 ওয়ার্কার: {MAX_WORKERS}")
+    print(f"🔌 কানেকশন পুল: {CONNECTION_POOL_SIZE}")
+    print(f"📱 মোট নাম্বার: {len(load_all_numbers())}")
+    print("="*50)
 
     while True:
         try:
             bot.infinity_polling(timeout=30, long_polling_timeout=60)
         except Exception as e:
-            print(f"[POLLING CRASH] {e}")
-            time.sleep(10)
+            print(f"[CRASH] {e}")
+            time.sleep(5)
