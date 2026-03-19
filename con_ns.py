@@ -3,9 +3,9 @@ import requests
 import time
 
 # --- কনফিগারেশন ---
-BOT_TOKEN = ""
-CHAT_ID = -          # আপনার গ্রুপের চ্যাট আইডি
-ADMIN_ID = 7095358778              # আপনার টেলিগ্রাম আইডি
+BOT_TOKEN = "8073903913:AAF8HvO-dlc8v7cAz_jgrmX0m6o2k_xRaDk"
+CHAT_ID = -1003868394296          # আপনার গ্রুপের চ্যাট আইডি
+ADMIN_ID = 7013727523              # আপনার টেলিগ্রাম আইডি
 
 LOGIN_URL  = "http://159.69.3.189/login"
 PORTAL_URL = "http://159.69.3.189/portal"
